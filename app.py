@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-import pyttsx3
+import time
 from collections import Counter
 from tensorflow import keras
 
@@ -11,9 +11,10 @@ from tensorflow import keras
 model = keras.models.load_model("asl_resnet_model.keras")
 print("✔ Model loaded")
 
-# Initialize TTS
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 150)
+# Initialize MediaPipe drawing utilities
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
 
 
 class StabilityBuffer:
@@ -52,9 +53,10 @@ def process_frame(frame, hands, model, buffer, label_map):
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(img_rgb)
     
-    current_word = ""
+    pending_char = ""  # Character waiting for time-based confirmation
     confidence = 0.0
     hand_detected = True
+    hand_landmarks = None  # For visualization
     
     if results.multi_hand_landmarks:
         # Extract landmarks (21 joints x 3 coords)
@@ -93,12 +95,12 @@ def process_frame(frame, hands, model, buffer, label_map):
             char = label_map[confirmed]
             if char == 'space':
                 char = ' '
-            current_word = char
+            pending_char = char  # This is now pending confirmation by time
     
     else:
         hand_detected = False
     
-    return current_word, confidence, hand_detected
+    return pending_char, confidence, hand_detected, hand_landmarks
 
 
 def run_asl_recognition():
@@ -117,11 +119,18 @@ def run_asl_recognition():
     # Initialize buffer and word
     buffer = StabilityBuffer(buffer_size=10, confirm_threshold=10)
     current_word = ""
-    last_hand_time = cv2.getTickCount()
+    
+    # Time-based letter confirmation
+    CHAR_CONFIRM_INTERVAL = 2.0  # Seconds to hold sign before confirming
+    pending_char = None  # Current character waiting to be confirmed
     
     cap = cv2.VideoCapture(0)
     
     print("Starting ASL recognition... Press 'q' to quit.")
+
+    last_pending_char = None
+    char_start_time = None
+
     
     while True:
         ret, frame = cap.read()
@@ -131,28 +140,41 @@ def run_asl_recognition():
         frame = cv2.flip(frame, 1)  # Mirror
         
         # Process frame
-        char, confidence, hand_detected = process_frame(
+        pending_char, confidence, hand_detected, hand_landmarks = process_frame(
             frame, hands, model, buffer, label_map
         )
         
-        # Update word
-        if char and char != current_word:
-            if char == ' ' and current_word and current_word[-1] != ' ':
-                current_word += char
-            elif char != ' ':
-                current_word += char
+        # Draw hand landmarks visualization
+        if hand_landmarks:
+            mp_drawing.draw_landmarks(
+                frame,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS,
+                mp_drawing_styles.get_default_hand_landmarks_style(),
+                mp_drawing_styles.get_default_hand_connections_style()
+            )
         
-        # Track hand detection for space/clear
-        if hand_detected:
-            last_hand_time = cv2.getTickCount()
-        else:
-            # No hand for 2 seconds = word finished
-            elapsed = (cv2.getTickCount() - last_hand_time) / cv2.getTickFrequency()
-            if elapsed > 2.0 and current_word.strip():
-                print(f"Word: {current_word.strip()}")
-                tts_engine.say(current_word.strip())
-                tts_engine.runAndWait()
-                current_word = ""
+        # Update word with time-based confirmation
+        current_time = time.time()
+
+        if pending_char and pending_char not in ('nothing',):
+            if pending_char != last_pending_char:
+                # Sign changed - restart timer
+                char_start_time = current_time
+                last_pending_char = pending_char
+            elif current_time - char_start_time > CHAR_CONFIRM_INTERVAL:
+                # 2 seconds held - confirm it
+                if pending_char == ' ':
+                    if current_word and current_word[-1] != ' ':
+                        current_word += pending_char
+                elif pending_char == 'del':
+                    current_word = current_word[:-1]
+                else:
+                    current_word += pending_char
+                
+                # Force user to briefly change sign before next letter
+                char_start_time = current_time  # reset timer
+                last_pending_char = None        # ← forget last char, so next L restarts cleanly
                 buffer.reset()
         
         # Display on frame
@@ -160,6 +182,17 @@ def run_asl_recognition():
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(frame, f"Conf: {confidence:.2f}", (10, 80), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        
+        # Show confirmation timer if a letter is pending
+        # if pending_char and last_letter_confirmed_time is not None:
+        #     elapsed = current_time - last_letter_confirmed_time
+        #     remaining = max(0, CHAR_CONFIRM_INTERVAL - elapsed)
+        if pending_char and pending_char != 'nothing' and char_start_time is not None:
+            elapsed = current_time - char_start_time
+            remaining = max(0, CHAR_CONFIRM_INTERVAL - elapsed)
+            color = (0, 255, 0) if remaining == 0 else (0, 165, 255)
+            cv2.putText(frame, f"Confirming '{pending_char}' in: {remaining:.1f}s", (10, 120), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         
         cv2.imshow("ASL Recognition", frame)
         
